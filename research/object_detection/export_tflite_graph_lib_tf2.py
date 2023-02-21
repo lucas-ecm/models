@@ -28,14 +28,13 @@ _DEFAULT_NUM_COORD_BOX = 4
 _MAX_CLASSES_PER_DETECTION = 1
 _DETECTION_POSTPROCESS_FUNC = 'TFLite_Detection_PostProcess'
 
+import tensorflow_model_optimization as tfmot
 
 def get_const_center_size_encoded_anchors(anchors):
   """Exports center-size encoded anchors as a constant tensor.
-
   Args:
     anchors: a float32 tensor of shape [num_anchors, 4] containing the anchor
       boxes
-
   Returns:
     encoded_anchors: a float32 constant tensor of shape [num_anchors, 4]
     containing the anchor boxes.
@@ -60,7 +59,6 @@ class SSDModule(tf.Module):
   def __init__(self, pipeline_config, detection_model, max_detections,
                use_regular_nms):
     """Initialization.
-
     Args:
       pipeline_config: The original pipeline_pb2.TrainEvalPipelineConfig
       detection_model: The detection model to use for inference.
@@ -151,15 +149,12 @@ class SSDModule(tf.Module):
   @tf.function
   def inference_fn(self, image):
     """Encapsulates SSD inference for TFLite conversion.
-
     NOTE: The Args & Returns sections below indicate the TFLite model signature,
     and not what the TF graph does (since the latter does not include the custom
     NMS op used by TFLite)
-
     Args:
       image: a float32 tensor of shape [num_anchors, 4] containing the anchor
         boxes
-
     Returns:
       num_detections: a float32 scalar denoting number of total detections.
       classes: a float32 tensor denoting class ID for each detection.
@@ -200,7 +195,6 @@ class SSDModule(tf.Module):
 
 class CenterNetModule(tf.Module):
   """Inference Module for TFLite-friendly CenterNet models.
-
   The exported CenterNet model includes the preprocessing and postprocessing
   logics so the caller should pass in the raw image pixel values. It supports
   both object detection and keypoint estimation task.
@@ -209,7 +203,6 @@ class CenterNetModule(tf.Module):
   def __init__(self, pipeline_config, max_detections, include_keypoints,
                label_map_path=''):
     """Initialization.
-
     Args:
       pipeline_config: The original pipeline_pb2.TrainEvalPipelineConfig
       max_detections: Max detections desired from the TFLite model.
@@ -262,11 +255,9 @@ class CenterNetModule(tf.Module):
   @tf.function
   def inference_fn(self, image):
     """Encapsulates CenterNet inference for TFLite conversion.
-
     Args:
       image: a float32 tensor of shape [1, image_height, image_width, channel]
         denoting the image pixel values.
-
     Returns:
       A dictionary of predicted tensors:
         classes: a float32 tensor with shape [1, max_detections] denoting class
@@ -310,14 +301,11 @@ def export_tflite_model(pipeline_config, trained_checkpoint_dir,
                         output_directory, max_detections, use_regular_nms,
                         include_keypoints=False, label_map_path=''):
   """Exports inference SavedModel for TFLite conversion.
-
   NOTE: Only supports SSD meta-architectures for now, and the output model will
   have static-shaped, single-batch input.
-
   This function creates `output_directory` if it does not already exist,
   which will hold the intermediate SavedModel that can be used with the TFLite
   converter.
-
   Args:
     pipeline_config: pipeline_pb2.TrainAndEvalPipelineConfig proto.
     trained_checkpoint_dir: Path to the trained checkpoint file.
@@ -330,12 +318,12 @@ def export_tflite_model(pipeline_config, trained_checkpoint_dir,
     label_map_path: Path to the label map which is used by CenterNet keypoint
       estimation task. If provided, the label_map_path in the configuration will
       be replaced by this one.
-
   Raises:
     ValueError: if pipeline is invalid.
   """
   output_saved_model_directory = os.path.join(output_directory, 'saved_model')
 
+  print('running')
   # Build the underlying model using pipeline config.
   # TODO(b/162842801): Add support for other architectures.
   if pipeline_config.model.WhichOneof('model') == 'ssd':
@@ -343,9 +331,40 @@ def export_tflite_model(pipeline_config, trained_checkpoint_dir,
         pipeline_config.model, is_training=False)
     ckpt = tf.train.Checkpoint(model=detection_model)
     # The module helps build a TF SavedModel appropriate for TFLite conversion.
-    detection_module = SSDModule(pipeline_config, detection_model,
+ 
+
+    # Pruning test
+    print('pruning')
+    prune_low_magnitude = tfmot.sparsity.keras.prune_low_magnitude
+    batch_size = 128
+    epochs = 2
+    validation_split = 0.1 # 10% of training set will be used for validation set. 
+    end_step = 1000
+    pruning_params = {
+          'pruning_schedule': tfmot.sparsity.keras.PolynomialDecay(initial_sparsity=0.5,
+                                                                    final_sparsity=0.7,
+                                                                    begin_step=0,
+                                                                    end_step=end_step)
+    }
+    def apply_pruning_to_dense(layer):
+      if isinstance(layer, tf.keras.layers.Conv2D):
+        return tfmot.sparsity.keras.prune_low_magnitude(layer)
+      return layer
+
+    # Use `tf.keras.models.clone_model` to apply `apply_pruning_to_dense` 
+    # to the layers of the model.
+    model_for_pruning = tf.keras.models.clone_model(
+        detection_model,
+        clone_function=apply_pruning_to_dense,
+    )
+
+    
+    detection_module = SSDModule(pipeline_config, model_for_pruning,
                                  max_detections, use_regular_nms)
+    # detection_module = SSDModule(pipeline_config, detection_model,
+                                #  max_detections, use_regular_nms)
   elif pipeline_config.model.WhichOneof('model') == 'center_net':
+    print('type-centernet')
     detection_module = CenterNetModule(
         pipeline_config, max_detections, include_keypoints,
         label_map_path=label_map_path)
@@ -372,3 +391,9 @@ def export_tflite_model(pipeline_config, trained_checkpoint_dir,
       detection_module,
       output_saved_model_directory,
       signatures=concrete_function)
+
+  #tf.keras.models.save_model(
+  #  detection_module,
+  #  '/content/output/saved_model_keras',
+  #  signatures=concrete_function
+  #)
